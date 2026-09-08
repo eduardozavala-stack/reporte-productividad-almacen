@@ -9,7 +9,6 @@ import streamlit as st
 
 APP_DIR = Path(__file__).parent
 HISTORY_PATH = APP_DIR / "data" / "productivity_history.csv"
-SOURCE_PATH = APP_DIR / "PRUEBA GITHUB.xlsx"
 HISTORY_COLUMNS = [
     "fecha",
     "operador",
@@ -66,18 +65,29 @@ def save_history(history: pd.DataFrame) -> None:
     history.to_csv(HISTORY_PATH, index=False, date_format="%Y-%m-%d")
 
 
-def load_initial_history() -> pd.DataFrame:
-    history = load_history()
-    if not history.empty or not SOURCE_PATH.exists():
-        return history
-    imported, _ = aggregate_source(read_excel(SOURCE_PATH.read_bytes()))
-    if not imported.empty:
-        save_history(imported)
-    return imported
+def read_csv(file_content: bytes) -> pd.DataFrame:
+    for encoding in ("utf-8-sig", "cp1252", "latin-1"):
+        try:
+            return pd.read_csv(
+                io.BytesIO(file_content),
+                sep=None,
+                engine="python",
+                encoding=encoding,
+            )
+        except UnicodeDecodeError:
+            continue
+    raise ValueError("No se pudo leer el CSV con las codificaciones UTF-8, CP1252 o Latin-1.")
 
 
-def read_excel(file_content: bytes) -> pd.DataFrame:
-    return pd.read_excel(io.BytesIO(file_content))
+def shift_from_datetime(values: pd.Series) -> pd.Series:
+    hours = values.dt.hour
+    return pd.Series(
+        pd.NA,
+        index=values.index,
+        dtype="string",
+    ).mask((hours >= 23) | (hours < 7), "Turno noche") \
+        .mask((hours >= 7) & (hours < 15), "Turno día") \
+        .mask((hours >= 15) & (hours < 23), "Turno tarde")
 
 
 def aggregate_source(source: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
@@ -98,7 +108,9 @@ def aggregate_source(source: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
 
     warnings = []
     prepared = pd.DataFrame()
-    prepared["fecha"] = pd.to_datetime(source[date_col], errors="coerce").dt.date
+    confirmation_datetime = pd.to_datetime(source[date_col], errors="coerce", format="mixed")
+    prepared["fecha"] = confirmation_datetime.dt.date
+    prepared["turno"] = shift_from_datetime(confirmation_datetime)
     prepared["operador"] = source[operator_col].fillna("Sin asignar").astype(str).replace("nan", "Sin asignar")
     prepared["lineas_preparadas"] = 1
     prepared["unidades_preparadas"] = (
@@ -120,7 +132,9 @@ def aggregate_source(source: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
         end = pd.to_datetime(
             source[date_col].astype(str) + " " + source[end_time_col].astype(str),
             errors="coerce",
+            format="mixed",
         )
+        end = end.where(end >= start, end + pd.Timedelta(days=1))
         minutes = (end - start).dt.total_seconds().div(60)
         minutes = minutes.where(minutes >= 0)
         prepared["horas_productivas"] = minutes.fillna(0).div(60)
@@ -132,14 +146,13 @@ def aggregate_source(source: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
 
     grouped = (
         prepared.dropna(subset=["fecha"])
-        .groupby(["fecha", "operador"], as_index=False)
+        .groupby(["fecha", "operador", "turno"], as_index=False)
         .agg(
             lineas_preparadas=("lineas_preparadas", "sum"),
             unidades_preparadas=("unidades_preparadas", "sum"),
             horas_productivas=("horas_productivas", "sum"),
         )
     )
-    grouped["turno"] = "Importado"
     grouped["incidencias"] = 0
     grouped["meta_lineas_hora"] = 20.0
     return grouped[HISTORY_COLUMNS], warnings
@@ -182,7 +195,7 @@ st.markdown(
 
 if "history" not in st.session_state:
     try:
-        st.session_state.history = load_initial_history()
+        st.session_state.history = load_history()
     except (ValueError, KeyError, TypeError, OSError) as exc:
         st.session_state.history = empty_history()
         st.warning(f"No se pudo cargar el archivo inicial: {exc}")
@@ -203,13 +216,15 @@ with st.sidebar:
         start_date = end_date = date_range
     operators = sorted(history["operador"].dropna().unique().tolist()) if not history.empty else []
     selected_operators = st.multiselect("Operador", operators, default=operators)
+    shifts = ["Turno noche", "Turno día", "Turno tarde"]
+    selected_shifts = st.multiselect("Turno", shifts, default=shifts)
 
     st.divider()
     st.header("Cargar datos")
-    uploaded = st.file_uploader("Excel histórico (.xlsx)", type=["xlsx"])
+    uploaded = st.file_uploader("Archivo CSV histórico (.csv)", type=["csv"])
     if uploaded and st.button("Importar y guardar histórico", type="primary", use_container_width=True):
         try:
-            imported, warnings = aggregate_source(read_excel(uploaded.getvalue()))
+            imported, warnings = aggregate_source(read_csv(uploaded.getvalue()))
             st.session_state.history = pd.concat([history, imported], ignore_index=True)
             save_history(st.session_state.history)
             st.success(f"Se importaron {len(imported):,} registros agregados.")
@@ -233,6 +248,7 @@ if not filtered.empty:
         (filtered["fecha"] >= start_date)
         & (filtered["fecha"] <= end_date)
         & filtered["operador"].isin(selected_operators)
+        & filtered["turno"].isin(selected_shifts)
     ]
 
 metrics = productivity_metrics(filtered) if not filtered.empty else {
@@ -249,7 +265,7 @@ tab_report, tab_capture, tab_data = st.tabs(["📊 Reporte", "➕ Registrar jorn
 
 with tab_report:
     if filtered.empty:
-        st.info("Carga un Excel o registra una jornada para comenzar el reporte.")
+        st.info("Carga un CSV o registra una jornada para comenzar el reporte.")
     else:
         daily = (
             filtered.groupby("fecha", as_index=False)
@@ -296,7 +312,7 @@ with tab_capture:
         c1, c2, c3 = st.columns(3)
         record_date = c1.date_input("Fecha", value=pd.Timestamp.today().date())
         operator = c2.text_input("Operador o equipo")
-        shift = c3.selectbox("Turno", ["Mañana", "Tarde", "Noche", "Importado"])
+        shift = c3.selectbox("Turno", ["Turno noche", "Turno día", "Turno tarde"])
         c4, c5, c6 = st.columns(3)
         lines = c4.number_input("Líneas preparadas", min_value=0, step=1)
         units = c5.number_input("Unidades preparadas", min_value=0, step=1)
