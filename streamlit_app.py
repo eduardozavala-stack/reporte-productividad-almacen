@@ -107,14 +107,12 @@ def shift_from_datetime(values: pd.Series) -> pd.Series:
 
 
 def classify_activity(source: pd.DataFrame, columns: list[str]) -> pd.Series:
-    queue_col = find_column(columns, ["Cola", "Recurso de origen"])
-    process_col = find_column(columns, ["Descr.tipo proceso almacén", "Tipo proceso almacén"])
+    queue_col = find_column(columns, ["Cola"])
     queue = source[queue_col].fillna("").astype(str).str.upper() if queue_col else pd.Series("", index=source.index)
-    process = source[process_col].fillna("").astype(str).str.lower() if process_col else pd.Series("", index=source.index)
     return pd.Series("Otros", index=source.index).mask(
         queue.str.startswith("PICK"), "Picking"
     ).mask(
-        process.str.contains("salida|extracci", regex=True), "Extracciones"
+        queue.str.startswith("SALIDA"), "Extracciones"
     )
 
 
@@ -126,6 +124,10 @@ def aggregate_source(source: pd.DataFrame, batch_id: str) -> tuple[pd.DataFrame,
         ["Ctd.prev.proced.UMA", "Unidades preparadas", "Cantidad"],
     )
     weight_col = find_column(list(source.columns), ["Peso de carga", "Peso Carga", "Peso"])
+    destination_col = find_column(
+        list(source.columns),
+        ["Tp.almacén destino", "Tipo almacén destino", "Tp almacen destino"],
+    )
     start_date_col = find_column(list(source.columns), ["Fe.inicio", "Fecha inicio"])
     start_time_col = find_column(list(source.columns), ["Hora inicio", "Hora de inicio"])
     end_time_col = find_column(
@@ -137,10 +139,15 @@ def aggregate_source(source: pd.DataFrame, batch_id: str) -> tuple[pd.DataFrame,
 
     warnings = []
     prepared = pd.DataFrame()
-    confirmation_datetime = pd.to_datetime(source[date_col], errors="coerce", format="mixed")
-    prepared["fecha"] = confirmation_datetime.dt.date
-    prepared["hora"] = confirmation_datetime.dt.hour
-    prepared["turno"] = shift_from_datetime(confirmation_datetime)
+    confirmation_date = pd.to_datetime(source[date_col], errors="coerce", format="mixed")
+    confirmation_time = (
+        pd.to_datetime(source[end_time_col], errors="coerce", format="mixed")
+        if end_time_col
+        else confirmation_date
+    )
+    prepared["fecha"] = confirmation_date.dt.date
+    prepared["hora"] = confirmation_time.dt.hour
+    prepared["turno"] = shift_from_datetime(confirmation_time)
     prepared["actividad"] = classify_activity(source, list(source.columns))
     prepared["batch_id"] = batch_id
     prepared["operador"] = source[operator_col].fillna("Sin asignar").astype(str).replace("nan", "Sin asignar")
@@ -152,6 +159,11 @@ def aggregate_source(source: pd.DataFrame, batch_id: str) -> tuple[pd.DataFrame,
     )
     if not weight_col:
         warnings.append("No se encontró Peso Carga; las toneladas quedaron en cero.")
+    if destination_col:
+        prepared = prepared[source[destination_col].astype(str).str.strip().eq("9025").to_numpy()]
+    else:
+        warnings.append("No se encontró Tp.almacén destino; no se aplicó el filtro 9025.")
+    prepared = prepared[prepared["actividad"].isin(["Picking", "Extracciones"])]
 
     if start_time_col and end_time_col:
         if start_date_col:
@@ -162,7 +174,7 @@ def aggregate_source(source: pd.DataFrame, batch_id: str) -> tuple[pd.DataFrame,
         else:
             start = pd.to_datetime(source[start_time_col], errors="coerce")
         end = pd.to_datetime(
-            source[date_col].astype(str) + " " + source[end_time_col].astype(str),
+            confirmation_date.dt.strftime("%Y-%m-%d") + " " + source[end_time_col].astype(str),
             errors="coerce",
             format="mixed",
         )
@@ -186,7 +198,9 @@ def aggregate_source(source: pd.DataFrame, batch_id: str) -> tuple[pd.DataFrame,
         )
     )
     grouped["incidencias"] = 0
-    grouped["meta_lineas_hora"] = 20.0
+    grouped["meta_lineas_hora"] = grouped["actividad"].map(
+        {"Picking": 1.2, "Extracciones": 10.0}
+    ).fillna(0)
     return grouped[HISTORY_COLUMNS], warnings
 
 
@@ -202,7 +216,7 @@ def append_remote_history(client: Client, records: pd.DataFrame) -> int:
     payload = records.assign(fecha=records["fecha"].astype(str)).to_dict("records")
     response = client.table("productivity_records").upsert(
         payload,
-        on_conflict="batch_id,fecha,operador,turno,actividad",
+        on_conflict="batch_id,fecha,operador,turno,actividad,hora",
         ignore_duplicates=True,
     ).execute()
     return len(response.data or [])
@@ -275,7 +289,7 @@ with st.sidebar:
     selected_operators = st.multiselect("Operador", operators, default=operators)
     shifts = ["Turno noche", "Turno día", "Turno tarde"]
     selected_shifts = st.multiselect("Turno", shifts, default=shifts)
-    activities = ["Picking", "Extracciones", "Otros"]
+    activities = ["Picking", "Extracciones"]
     selected_activities = st.multiselect("Actividad", activities, default=activities)
 
     st.divider()
@@ -364,11 +378,34 @@ with tab_report:
             fig.update_layout(height=300, margin=dict(l=5, r=5, t=45, b=5), legend_title_text="")
             container.plotly_chart(fig, use_container_width=True)
 
-        st.markdown('<div class="section-title">Productividad por hora</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Productividad por hora: procesos con metas independientes</div>', unsafe_allow_html=True)
         hourly = filtered.groupby(["actividad", "hora"], as_index=False)["toneladas_preparadas"].sum()
         hourly_table = hourly.pivot(index="actividad", columns="hora", values="toneladas_preparadas").reindex(columns=range(24), fill_value=0).fillna(0)
         hourly_table.columns = [f"{hour:02d}" for hour in hourly_table.columns]
         hourly_table["Total"] = hourly_table.sum(axis=1)
+        h1, h2 = st.columns(2)
+        for container, activity, target, color in [
+            (h1, "Picking", 1.2, "#2ca25f"),
+            (h2, "Extracciones", 10.0, "#d52b2f"),
+        ]:
+            hourly_activity = (
+                hourly[hourly["actividad"].eq(activity)]
+                .set_index("hora")["toneladas_preparadas"]
+                .reindex(range(24), fill_value=0)
+                .rename_axis("hora")
+                .reset_index()
+            )
+            figure = px.bar(
+                hourly_activity,
+                x="hora",
+                y="toneladas_preparadas",
+                title=f"{activity} · meta {target:g} TN/h",
+                labels={"hora": "Hora de confirmación", "toneladas_preparadas": "Toneladas"},
+                color_discrete_sequence=[color],
+            )
+            figure.add_hline(y=target, line_dash="dash", line_color="#172033", annotation_text=f"Meta {target:g} TN/h")
+            figure.update_layout(height=300, xaxis=dict(dtick=1), margin=dict(l=5, r=5, t=50, b=5))
+            container.plotly_chart(figure, use_container_width=True)
         st.dataframe(
             hourly_table.style.format("{:,.2f}"),
             use_container_width=True,

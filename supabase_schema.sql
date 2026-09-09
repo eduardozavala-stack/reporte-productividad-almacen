@@ -12,11 +12,21 @@ create table if not exists public.productivity_records (
   meta_lineas_hora numeric not null default 20,
   batch_id text not null,
   created_at timestamptz not null default now(),
-  unique (batch_id, fecha, operador, turno, actividad)
+  unique (batch_id, fecha, operador, turno, actividad, hora)
 );
 
 alter table public.productivity_records
   add column if not exists hora integer not null default 0;
+
+alter table public.productivity_records
+  drop constraint if exists productivity_records_batch_id_fecha_operador_turno_actividad_key;
+
+alter table public.productivity_records
+  drop constraint if exists productivity_records_batch_fecha_operador_turno_actividad_hora_key;
+
+alter table public.productivity_records
+  add constraint productivity_records_batch_fecha_operador_turno_actividad_hora_key
+  unique (batch_id, fecha, operador, turno, actividad, hora);
 
 create index if not exists productivity_records_fecha_idx
   on public.productivity_records (fecha);
