@@ -369,7 +369,10 @@ with tab_report:
         hourly_table = hourly.pivot(index="actividad", columns="hora", values="toneladas_preparadas").reindex(columns=range(24), fill_value=0).fillna(0)
         hourly_table.columns = [f"{hour:02d}" for hour in hourly_table.columns]
         hourly_table["Total"] = hourly_table.sum(axis=1)
-        st.dataframe(hourly_table.style.background_gradient(cmap="RdYlGn", axis=None).format("{:,.2f}"), use_container_width=True)
+        st.dataframe(
+            hourly_table.style.format("{:,.2f}"),
+            use_container_width=True,
+        )
 
         by_operator = (
             filtered.groupby("operador", as_index=False)

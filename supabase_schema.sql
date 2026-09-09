@@ -23,6 +23,13 @@ create index if not exists productivity_records_fecha_idx
 
 alter table public.productivity_records enable row level security;
 
+drop policy if exists "authenticated users can read productivity"
+  on public.productivity_records;
+drop policy if exists "authenticated users can insert productivity"
+  on public.productivity_records;
+drop policy if exists "authenticated users can update productivity"
+  on public.productivity_records;
+
 create policy "authenticated users can read productivity"
   on public.productivity_records for select to authenticated using (true);
 
