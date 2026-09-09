@@ -160,7 +160,8 @@ def aggregate_source(source: pd.DataFrame, batch_id: str) -> tuple[pd.DataFrame,
     if not weight_col:
         warnings.append("No se encontró Peso Carga; las toneladas quedaron en cero.")
     if destination_col:
-        prepared = prepared[source[destination_col].astype(str).str.strip().eq("9025").to_numpy()]
+        destination = pd.to_numeric(source[destination_col], errors="coerce")
+        prepared = prepared[destination.eq(9025).to_numpy()]
     else:
         warnings.append("No se encontró Tp.almacén destino; no se aplicó el filtro 9025.")
     prepared = prepared[prepared["actividad"].isin(["Picking", "Extracciones"])]
@@ -220,6 +221,15 @@ def append_remote_history(client: Client, records: pd.DataFrame) -> int:
         ignore_duplicates=True,
     ).execute()
     return len(response.data or [])
+
+
+def replace_remote_batch(client: Client, records: pd.DataFrame, batch_id: str) -> int:
+    client.table("productivity_records").delete().eq("batch_id", batch_id).execute()
+    return append_remote_history(client, records)
+
+
+def reset_remote_history(client: Client) -> None:
+    client.table("productivity_records").delete().gt("id", 0).execute()
 
 
 def productivity_metrics(history: pd.DataFrame) -> dict[str, float]:
@@ -289,7 +299,7 @@ with st.sidebar:
     selected_operators = st.multiselect("Operador", operators, default=operators)
     shifts = ["Turno noche", "Turno día", "Turno tarde"]
     selected_shifts = st.multiselect("Turno", shifts, default=shifts)
-    activities = ["Picking", "Extracciones"]
+    activities = ["Picking", "Extracciones", "Otros"]
     selected_activities = st.multiselect("Actividad", activities, default=activities)
 
     st.divider()
@@ -301,7 +311,7 @@ with st.sidebar:
             imported, warnings = aggregate_source(read_csv(uploaded.getvalue()), batch_id)
             remote = supabase_client()
             if remote:
-                inserted = append_remote_history(remote, imported)
+                inserted = replace_remote_batch(remote, imported, batch_id)
                 st.session_state.history = load_remote_history(remote)
                 st.success(f"Se guardaron {inserted:,} registros nuevos en Supabase.")
             else:
@@ -312,6 +322,25 @@ with st.sidebar:
                 st.warning(warning)
         except (ValueError, KeyError, TypeError) as exc:
             st.error(f"No se pudo importar el archivo: {exc}")
+
+    st.divider()
+    st.header("Administración")
+    reset_confirmed = st.checkbox("Confirmo que deseo borrar todo el histórico", key="reset_confirmed")
+    if st.button("Reiniciar todo el historial", use_container_width=True, disabled=not reset_confirmed):
+        try:
+            remote = supabase_client()
+            if remote:
+                reset_remote_history(remote)
+                st.session_state.history = empty_history()
+                st.success("Histórico de Supabase eliminado correctamente.")
+            else:
+                save_history(empty_history())
+                st.session_state.history = empty_history()
+                st.success("Histórico local eliminado correctamente.")
+            st.session_state.reset_confirmed = False
+            st.rerun()
+        except (ValueError, KeyError, TypeError, OSError) as exc:
+            st.error(f"No se pudo reiniciar el histórico: {exc}")
 
     if HISTORY_PATH.exists():
         st.download_button(
@@ -335,13 +364,12 @@ if not filtered.empty:
 metrics = productivity_metrics(filtered) if not filtered.empty else {
     "lines": 0, "tons": 0, "hours": 0, "rate": 0, "tons_rate": 0, "incidents": 0
 }
-col1, col2, col3, col4, col5, col6 = st.columns(6)
+col1, col2, col3, col4, col5 = st.columns(5)
 col1.metric("Toneladas preparadas", f"{metrics['tons']:,.2f} TN")
 col2.metric("Picking", f"{filtered.loc[filtered['actividad'].eq('Picking'), 'toneladas_preparadas'].sum():,.2f} TN" if not filtered.empty else "0.00 TN")
 col3.metric("Extracciones", f"{filtered.loc[filtered['actividad'].eq('Extracciones'), 'toneladas_preparadas'].sum():,.2f} TN" if not filtered.empty else "0.00 TN")
 col4.metric("Toneladas / hora", f"{metrics['tons_rate']:,.2f}")
 col5.metric("Horas productivas", f"{metrics['hours']:,.1f}")
-col6.metric("Incidencias", f"{metrics['incidents']:,.0f}")
 
 tab_report, tab_capture, tab_data = st.tabs(["📊 Reporte", "➕ Registrar jornada", "🗃️ Histórico"])
 
@@ -349,16 +377,9 @@ with tab_report:
     if filtered.empty:
         st.info("Carga un CSV o registra una jornada para comenzar el reporte.")
     else:
-        st.markdown('<div class="section-title">Avance de productividad</div>', unsafe_allow_html=True)
-        gauge = go.Figure(go.Indicator(
-            mode="gauge+number",
-            value=metrics["tons"],
-            number={"suffix": " TN", "valueformat": ".2f"},
-            title={"text": "Toneladas acumuladas"},
-            gauge={"axis": {"range": [0, max(metrics["tons"] * 1.25, 1)]}, "bar": {"color": "#d52b2f"}, "steps": [{"range": [0, max(metrics["tons"] * .65, 1)], "color": "#f4f5f7"}, {"range": [max(metrics["tons"] * .65, 1), max(metrics["tons"] * 1.25, 1)], "color": "#e7f3ea"}]},
-        ))
-        gauge.update_layout(height=230, margin=dict(l=20, r=20, t=45, b=5))
-        st.plotly_chart(gauge, use_container_width=True)
+        st.markdown('<div class="section-title">Resumen ejecutivo</div>', unsafe_allow_html=True)
+        st.caption("El total considera todas las filas con Tp. almacén destino igual a 9025.")
+        st.metric("Preparación acumulada", f"{metrics['tons']:,.2f} TN")
 
         daily = filtered.groupby(["fecha", "actividad"], as_index=False)["toneladas_preparadas"].sum()
         chart = px.bar(daily, x="fecha", y="toneladas_preparadas", color="actividad", barmode="stack",
@@ -370,42 +391,53 @@ with tab_report:
         weekly = filtered.assign(semana=filtered["fecha"].apply(lambda value: f"{value.isocalendar().year}-S{value.isocalendar().week:02d}")).groupby(["semana", "actividad"], as_index=False)["toneladas_preparadas"].sum()
         monthly = filtered.assign(mes=filtered["fecha"].apply(lambda value: value.strftime("%Y-%m"))).groupby(["mes", "actividad"], as_index=False)["toneladas_preparadas"].sum()
         by_shift = filtered.groupby(["turno", "actividad"], as_index=False)["toneladas_preparadas"].sum()
-        b1, b2, b3 = st.columns(3)
-        for container, data, x, title in [(b1, weekly, "semana", "Preparación por semana"), (b2, monthly, "mes", "Preparación por mes"), (b3, by_shift, "turno", "Preparación por turno")]:
+        b1, b2 = st.columns(2)
+        for container, data, x, title in [(b1, weekly, "semana", "Preparación por semana"), (b2, by_shift, "turno", "Preparación por turno")]:
             fig = px.bar(data, x=x, y="toneladas_preparadas", color="actividad", barmode="stack", title=title,
                          labels={x: x.capitalize(), "toneladas_preparadas": "TN", "actividad": ""},
                          color_discrete_map={"Picking": "#2ca25f", "Extracciones": "#d52b2f", "Otros": "#68748a"})
             fig.update_layout(height=300, margin=dict(l=5, r=5, t=45, b=5), legend_title_text="")
             container.plotly_chart(fig, use_container_width=True)
+        monthly_total = monthly.groupby("mes", as_index=False)["toneladas_preparadas"].sum()
+        monthly_chart = px.bar(
+            monthly_total,
+            x="mes",
+            y="toneladas_preparadas",
+            text_auto=".2f",
+            title="Preparación mensual · destino 9025",
+            labels={"mes": "Mes", "toneladas_preparadas": "Toneladas"},
+            color_discrete_sequence=["#b71520"],
+        )
+        monthly_chart.update_layout(height=360, margin=dict(l=10, r=10, t=50, b=10), showlegend=False)
+        st.plotly_chart(monthly_chart, use_container_width=True)
 
-        st.markdown('<div class="section-title">Productividad por hora: procesos con metas independientes</div>', unsafe_allow_html=True)
-        hourly = filtered.groupby(["actividad", "hora"], as_index=False)["toneladas_preparadas"].sum()
-        hourly_table = hourly.pivot(index="actividad", columns="hora", values="toneladas_preparadas").reindex(columns=range(24), fill_value=0).fillna(0)
+        st.markdown('<div class="section-title">Productividad Picking por hora de confirmación</div>', unsafe_allow_html=True)
+        hourly = (
+            filtered[filtered["actividad"].eq("Picking")]
+            .groupby("hora", as_index=False)["toneladas_preparadas"]
+            .sum()
+        )
+        hourly_activity = (
+            hourly.set_index("hora")["toneladas_preparadas"]
+            .reindex(range(24), fill_value=0)
+            .rename_axis("hora")
+            .reset_index()
+        )
+        hourly_table = hourly_activity.set_index("hora").T
         hourly_table.columns = [f"{hour:02d}" for hour in hourly_table.columns]
+        hourly_table.index = ["Picking"]
         hourly_table["Total"] = hourly_table.sum(axis=1)
-        h1, h2 = st.columns(2)
-        for container, activity, target, color in [
-            (h1, "Picking", 1.2, "#2ca25f"),
-            (h2, "Extracciones", 10.0, "#d52b2f"),
-        ]:
-            hourly_activity = (
-                hourly[hourly["actividad"].eq(activity)]
-                .set_index("hora")["toneladas_preparadas"]
-                .reindex(range(24), fill_value=0)
-                .rename_axis("hora")
-                .reset_index()
-            )
-            figure = px.bar(
-                hourly_activity,
-                x="hora",
-                y="toneladas_preparadas",
-                title=f"{activity} · meta {target:g} TN/h",
-                labels={"hora": "Hora de confirmación", "toneladas_preparadas": "Toneladas"},
-                color_discrete_sequence=[color],
-            )
-            figure.add_hline(y=target, line_dash="dash", line_color="#172033", annotation_text=f"Meta {target:g} TN/h")
-            figure.update_layout(height=300, xaxis=dict(dtick=1), margin=dict(l=5, r=5, t=50, b=5))
-            container.plotly_chart(figure, use_container_width=True)
+        figure = px.bar(
+            hourly_activity,
+            x="hora",
+            y="toneladas_preparadas",
+            title="Picking · meta 1.2 TN/h",
+            labels={"hora": "Hora de confirmación", "toneladas_preparadas": "Toneladas"},
+            color_discrete_sequence=["#2ca25f"],
+        )
+        figure.add_hline(y=1.2, line_dash="dash", line_color="#172033", annotation_text="Meta 1.2 TN/h")
+        figure.update_layout(height=330, xaxis={"tickmode": "linear", "dtick": 1, "range": [-0.5, 23.5]}, margin=dict(l=5, r=5, t=50, b=5))
+        st.plotly_chart(figure, use_container_width=True)
         st.dataframe(
             hourly_table.style.format("{:,.2f}"),
             use_container_width=True,
