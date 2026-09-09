@@ -5,6 +5,7 @@ import unicodedata
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 from supabase import Client, create_client
 
@@ -16,6 +17,7 @@ HISTORY_COLUMNS = [
     "operador",
     "turno",
     "actividad",
+    "hora",
     "lineas_preparadas",
     "toneladas_preparadas",
     "horas_productivas",
@@ -59,7 +61,7 @@ def normalize_history(history: pd.DataFrame) -> pd.DataFrame:
         if column not in history:
             history[column] = "Sin asignar" if column in {"actividad", "batch_id"} else 0
     history["fecha"] = pd.to_datetime(history["fecha"], errors="coerce").dt.date
-    numeric = ["lineas_preparadas", "toneladas_preparadas", "horas_productivas", "incidencias", "meta_lineas_hora"]
+    numeric = ["hora", "lineas_preparadas", "toneladas_preparadas", "horas_productivas", "incidencias", "meta_lineas_hora"]
     for column in numeric:
         history[column] = pd.to_numeric(history[column], errors="coerce").fillna(0)
     history["actividad"] = history["actividad"].fillna("Sin clasificar").astype(str)
@@ -137,6 +139,7 @@ def aggregate_source(source: pd.DataFrame, batch_id: str) -> tuple[pd.DataFrame,
     prepared = pd.DataFrame()
     confirmation_datetime = pd.to_datetime(source[date_col], errors="coerce", format="mixed")
     prepared["fecha"] = confirmation_datetime.dt.date
+    prepared["hora"] = confirmation_datetime.dt.hour
     prepared["turno"] = shift_from_datetime(confirmation_datetime)
     prepared["actividad"] = classify_activity(source, list(source.columns))
     prepared["batch_id"] = batch_id
@@ -175,7 +178,7 @@ def aggregate_source(source: pd.DataFrame, batch_id: str) -> tuple[pd.DataFrame,
 
     grouped = (
         prepared.dropna(subset=["fecha"])
-        .groupby(["fecha", "operador", "turno", "actividad", "batch_id"], as_index=False)
+        .groupby(["fecha", "operador", "turno", "actividad", "hora", "batch_id"], as_index=False)
         .agg(
             lineas_preparadas=("lineas_preparadas", "sum"),
             toneladas_preparadas=("toneladas_preparadas", "sum"),
@@ -213,6 +216,7 @@ def productivity_metrics(history: pd.DataFrame) -> dict[str, float]:
         "tons": history["toneladas_preparadas"].sum(),
         "hours": hours,
         "rate": lines / hours if hours else 0,
+        "tons_rate": history["toneladas_preparadas"].sum() / hours if hours else 0,
         "incidents": history["incidencias"].sum(),
     }
 
@@ -226,19 +230,24 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    .block-container {padding-top: 2rem; padding-bottom: 3rem;}
-    [data-testid="stMetricValue"] {color: #0b6e4f;}
+    .block-container {padding-top: 1rem; padding-bottom: 2rem; max-width: 1500px;}
+    [data-testid="stMetricValue"] {color: #172033; font-size: 1.55rem;}
+    [data-testid="stMetric"] {background: #ffffff; border: 1px solid #e4e8ef; border-radius: 12px; padding: .7rem .9rem;}
     .subtitle {color: #64748b; margin-top: -0.8rem;}
+    .dashboard-header {background: linear-gradient(90deg, #9f1017, #d52b2f); color: white; padding: .7rem 1rem; border-radius: 10px; margin-bottom: 1rem;}
+    .dashboard-header h1 {font-size: 1.15rem; margin: 0; color: white;}
+    .section-title {font-weight: 700; color: #243047; margin: .8rem 0 .2rem;}
+    .small-note {font-size: .78rem; color: #64748b;}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-st.title("📦 Productividad de preparación")
 st.markdown(
-    '<p class="subtitle">Reporte operativo para medir el desempeño del almacén y construir una historia diaria confiable.</p>',
+    '<div class="dashboard-header"><h1>📦 REPORTE DE PRODUCTIVIDAD · PREPARACIÓN DE ALMACÉN</h1></div>',
     unsafe_allow_html=True,
 )
+st.markdown('<p class="subtitle">Control operativo de toneladas preparadas, picking y extracciones.</p>', unsafe_allow_html=True)
 
 if "history" not in st.session_state:
     try:
@@ -310,14 +319,15 @@ if not filtered.empty:
     ]
 
 metrics = productivity_metrics(filtered) if not filtered.empty else {
-    "lines": 0, "tons": 0, "hours": 0, "rate": 0, "incidents": 0
+    "lines": 0, "tons": 0, "hours": 0, "rate": 0, "tons_rate": 0, "incidents": 0
 }
-col1, col2, col3, col4, col5 = st.columns(5)
-col1.metric("Toneladas preparadas", f"{metrics['tons']:,.2f}")
-col2.metric("Líneas de referencia", f"{metrics['lines']:,.0f}")
-col3.metric("Horas productivas", f"{metrics['hours']:,.1f}")
-col4.metric("Líneas / hora", f"{metrics['rate']:,.1f}")
-col5.metric("Incidencias", f"{metrics['incidents']:,.0f}")
+col1, col2, col3, col4, col5, col6 = st.columns(6)
+col1.metric("Toneladas preparadas", f"{metrics['tons']:,.2f} TN")
+col2.metric("Picking", f"{filtered.loc[filtered['actividad'].eq('Picking'), 'toneladas_preparadas'].sum():,.2f} TN" if not filtered.empty else "0.00 TN")
+col3.metric("Extracciones", f"{filtered.loc[filtered['actividad'].eq('Extracciones'), 'toneladas_preparadas'].sum():,.2f} TN" if not filtered.empty else "0.00 TN")
+col4.metric("Toneladas / hora", f"{metrics['tons_rate']:,.2f}")
+col5.metric("Horas productivas", f"{metrics['hours']:,.1f}")
+col6.metric("Incidencias", f"{metrics['incidents']:,.0f}")
 
 tab_report, tab_capture, tab_data = st.tabs(["📊 Reporte", "➕ Registrar jornada", "🗃️ Histórico"])
 
@@ -325,33 +335,41 @@ with tab_report:
     if filtered.empty:
         st.info("Carga un CSV o registra una jornada para comenzar el reporte.")
     else:
-        daily = (
-            filtered.groupby("fecha", as_index=False)
-            .agg(
-                lineas_preparadas=("lineas_preparadas", "sum"),
-                toneladas_preparadas=("toneladas_preparadas", "sum"),
-                horas_productivas=("horas_productivas", "sum"),
-            )
-        )
-        daily["toneladas_hora"] = daily["toneladas_preparadas"].div(daily["horas_productivas"].replace(0, pd.NA))
-        chart = px.line(
-            daily,
-            x="fecha",
-            y="toneladas_preparadas",
-            markers=True,
-            title="Evolución diaria de toneladas preparadas",
-            labels={"fecha": "Fecha", "toneladas_preparadas": "Toneladas"},
-        )
-        chart.update_layout(height=360, margin=dict(l=10, r=10, t=50, b=10))
+        st.markdown('<div class="section-title">Avance de productividad</div>', unsafe_allow_html=True)
+        gauge = go.Figure(go.Indicator(
+            mode="gauge+number",
+            value=metrics["tons"],
+            number={"suffix": " TN", "valueformat": ".2f"},
+            title={"text": "Toneladas acumuladas"},
+            gauge={"axis": {"range": [0, max(metrics["tons"] * 1.25, 1)]}, "bar": {"color": "#d52b2f"}, "steps": [{"range": [0, max(metrics["tons"] * .65, 1)], "color": "#f4f5f7"}, {"range": [max(metrics["tons"] * .65, 1), max(metrics["tons"] * 1.25, 1)], "color": "#e7f3ea"}]},
+        ))
+        gauge.update_layout(height=230, margin=dict(l=20, r=20, t=45, b=5))
+        st.plotly_chart(gauge, use_container_width=True)
+
+        daily = filtered.groupby(["fecha", "actividad"], as_index=False)["toneladas_preparadas"].sum()
+        chart = px.bar(daily, x="fecha", y="toneladas_preparadas", color="actividad", barmode="stack",
+                       title="Preparación diaria por actividad", labels={"fecha": "Fecha", "toneladas_preparadas": "Toneladas", "actividad": "Actividad"},
+                       color_discrete_map={"Picking": "#2ca25f", "Extracciones": "#d52b2f", "Otros": "#68748a"})
+        chart.update_layout(height=330, margin=dict(l=10, r=10, t=50, b=10), legend_title_text="")
         st.plotly_chart(chart, use_container_width=True)
 
-        weekly = filtered.assign(semana=filtered["fecha"].apply(lambda value: value.isocalendar().week)).groupby("semana", as_index=False)["toneladas_preparadas"].sum()
-        monthly = filtered.assign(mes=filtered["fecha"].apply(lambda value: value.strftime("%Y-%m"))).groupby("mes", as_index=False)["toneladas_preparadas"].sum()
-        by_shift = filtered.groupby("turno", as_index=False)["toneladas_preparadas"].sum()
+        weekly = filtered.assign(semana=filtered["fecha"].apply(lambda value: f"{value.isocalendar().year}-S{value.isocalendar().week:02d}")).groupby(["semana", "actividad"], as_index=False)["toneladas_preparadas"].sum()
+        monthly = filtered.assign(mes=filtered["fecha"].apply(lambda value: value.strftime("%Y-%m"))).groupby(["mes", "actividad"], as_index=False)["toneladas_preparadas"].sum()
+        by_shift = filtered.groupby(["turno", "actividad"], as_index=False)["toneladas_preparadas"].sum()
         b1, b2, b3 = st.columns(3)
-        b1.plotly_chart(px.bar(weekly, x="semana", y="toneladas_preparadas", title="Preparación por semana", labels={"semana": "Semana", "toneladas_preparadas": "Toneladas"}), use_container_width=True)
-        b2.plotly_chart(px.bar(monthly, x="mes", y="toneladas_preparadas", title="Preparación por mes", labels={"mes": "Mes", "toneladas_preparadas": "Toneladas"}), use_container_width=True)
-        b3.plotly_chart(px.bar(by_shift, x="turno", y="toneladas_preparadas", title="Preparación por turno", labels={"turno": "Turno", "toneladas_preparadas": "Toneladas"}), use_container_width=True)
+        for container, data, x, title in [(b1, weekly, "semana", "Preparación por semana"), (b2, monthly, "mes", "Preparación por mes"), (b3, by_shift, "turno", "Preparación por turno")]:
+            fig = px.bar(data, x=x, y="toneladas_preparadas", color="actividad", barmode="stack", title=title,
+                         labels={x: x.capitalize(), "toneladas_preparadas": "TN", "actividad": ""},
+                         color_discrete_map={"Picking": "#2ca25f", "Extracciones": "#d52b2f", "Otros": "#68748a"})
+            fig.update_layout(height=300, margin=dict(l=5, r=5, t=45, b=5), legend_title_text="")
+            container.plotly_chart(fig, use_container_width=True)
+
+        st.markdown('<div class="section-title">Productividad por hora</div>', unsafe_allow_html=True)
+        hourly = filtered.groupby(["actividad", "hora"], as_index=False)["toneladas_preparadas"].sum()
+        hourly_table = hourly.pivot(index="actividad", columns="hora", values="toneladas_preparadas").reindex(columns=range(24), fill_value=0).fillna(0)
+        hourly_table.columns = [f"{hour:02d}" for hour in hourly_table.columns]
+        hourly_table["Total"] = hourly_table.sum(axis=1)
+        st.dataframe(hourly_table.style.background_gradient(cmap="RdYlGn", axis=None).format("{:,.2f}"), use_container_width=True)
 
         by_operator = (
             filtered.groupby("operador", as_index=False)
@@ -362,11 +380,15 @@ with tab_report:
                 incidencias=("incidencias", "sum"),
             )
         )
-        by_operator["lineas_hora"] = by_operator["lineas"].div(by_operator["horas"].replace(0, pd.NA))
-        st.subheader("Desempeño por operador")
+        by_operator["toneladas_hora"] = by_operator["toneladas"].div(by_operator["horas"].replace(0, pd.NA))
+        st.markdown('<div class="section-title">Top operadores por toneladas</div>', unsafe_allow_html=True)
+        ranking = by_operator.sort_values("toneladas", ascending=False).head(10)
+        st.plotly_chart(px.bar(ranking, x="toneladas", y="operador", orientation="h", text_auto=".2f",
+                               title="Ranking de preparación", labels={"toneladas": "Toneladas", "operador": ""}, color_discrete_sequence=["#b71520"]),
+                        use_container_width=True)
         st.dataframe(
-            by_operator.sort_values("lineas_hora", ascending=False).style.format(
-                {"lineas": "{:,.0f}", "toneladas": "{:,.2f}", "horas": "{:,.1f}", "lineas_hora": "{:,.1f}"}
+            by_operator.sort_values("toneladas", ascending=False).style.format(
+                {"lineas": "{:,.0f}", "toneladas": "{:,.2f}", "horas": "{:,.1f}", "toneladas_hora": "{:,.2f}"}
             ),
             use_container_width=True,
             hide_index=True,

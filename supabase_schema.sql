@@ -4,6 +4,7 @@ create table if not exists public.productivity_records (
   operador text not null,
   turno text not null,
   actividad text not null,
+  hora integer not null default 0,
   lineas_preparadas numeric not null default 0,
   toneladas_preparadas numeric not null default 0,
   horas_productivas numeric not null default 0,
@@ -13,6 +14,9 @@ create table if not exists public.productivity_records (
   created_at timestamptz not null default now(),
   unique (batch_id, fecha, operador, turno, actividad)
 );
+
+alter table public.productivity_records
+  add column if not exists hora integer not null default 0;
 
 create index if not exists productivity_records_fecha_idx
   on public.productivity_records (fecha);
