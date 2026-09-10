@@ -25,6 +25,9 @@ alter table public.productivity_records
   drop constraint if exists productivity_records_batch_fecha_operador_turno_actividad_hora_key;
 
 alter table public.productivity_records
+  drop constraint if exists productivity_records_batch_id_fecha_operador_turno_actividad_hora_key;
+
+alter table public.productivity_records
   add constraint productivity_records_batch_fecha_operador_turno_actividad_hora_key
   unique (batch_id, fecha, operador, turno, actividad, hora);
 

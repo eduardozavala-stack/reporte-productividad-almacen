@@ -22,9 +22,11 @@ El turno se calcula automáticamente desde `Fecha confirmación`:
 - `Turno día`: 07:00 a 15:00
 - `Turno tarde`: 15:00 a 23:00
 
-La actividad se clasifica como `Picking` cuando `Cola` comienza con `PICK`, y como
-`Extracciones` cuando el tipo de proceso contiene salida o extracción. El peso de
-`Peso Carga` se convierte de kilogramos a toneladas.
+Solo se consideran registros con `Tp.almacén destino` igual a `9025`. La actividad
+se clasifica como `Picking` cuando `Cola` comienza con `PICK`, como `Extracciones`
+cuando comienza con `SALIDA`, y como `Otros` para el resto de colas. El peso de
+`Peso Carga` se convierte de kilogramos a toneladas; por eso el total mensual
+incluye todas las actividades del destino 9025.
 
 ## Configurar Supabase
 
@@ -39,5 +41,10 @@ SUPABASE_SERVICE_KEY = "tu-service-role-key"
 Con los secrets configurados, cada CSV se guarda en Supabase. El hash del archivo
 evita insertar dos veces el mismo CSV. La service-role key debe mantenerse
 únicamente en Streamlit Secrets y nunca publicarse en GitHub.
+
+En la sección **Administración** de la aplicación existe el botón **Reiniciar todo
+el historial**. Requiere marcar una confirmación y elimina todos los registros,
+tanto de Supabase como del histórico local si Supabase no está configurado. Debe
+usarse antes de una recarga completa cuando se cambien las reglas de interpretación.
 
 Las jornadas capturadas se guardan en `data/productivity_history.csv`. En Streamlit Community Cloud el almacenamiento local puede reiniciarse; usa **Descargar histórico CSV** para respaldar la información y volver a cargarla cuando sea necesario.
