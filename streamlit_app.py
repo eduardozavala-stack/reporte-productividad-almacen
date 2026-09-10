@@ -5,7 +5,6 @@ import unicodedata
 
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
 from supabase import Client, create_client
 
@@ -84,12 +83,15 @@ def save_history(history: pd.DataFrame) -> None:
 def read_csv(file_content: bytes) -> pd.DataFrame:
     for encoding in ("utf-8-sig", "cp1252", "latin-1"):
         try:
-            return pd.read_csv(
+            parsed = pd.read_csv(
                 io.BytesIO(file_content),
                 sep=None,
                 engine="python",
                 encoding=encoding,
             )
+            if any("\ufffd" in str(column) for column in parsed.columns):
+                continue
+            return parsed
         except UnicodeDecodeError:
             continue
     raise ValueError("No se pudo leer el CSV con las codificaciones UTF-8, CP1252 o Latin-1.")
@@ -119,10 +121,6 @@ def classify_activity(source: pd.DataFrame, columns: list[str]) -> pd.Series:
 def aggregate_source(source: pd.DataFrame, batch_id: str) -> tuple[pd.DataFrame, list[str]]:
     date_col = find_column(list(source.columns), ["Fecha confirmación", "Fecha"])
     operator_col = find_column(list(source.columns), ["Confirmado por", "Operador", "Usuario"])
-    quantity_col = find_column(
-        list(source.columns),
-        ["Ctd.prev.proced.UMA", "Unidades preparadas", "Cantidad"],
-    )
     weight_col = find_column(list(source.columns), ["Peso de carga", "Peso Carga", "Peso"])
     destination_col = find_column(
         list(source.columns),
@@ -134,8 +132,11 @@ def aggregate_source(source: pd.DataFrame, batch_id: str) -> tuple[pd.DataFrame,
         list(source.columns),
         ["Hora de confirmación", "Hora confirmación", "Hora fin"],
     )
-    if not date_col or not operator_col:
-        raise ValueError("El archivo debe incluir columnas de fecha y operador.")
+    if not date_col or not operator_col or not weight_col or not destination_col:
+        raise ValueError(
+            "El archivo debe incluir Fecha confirmación, Confirmado por, "
+            "Peso de carga y Tp.almacén destino."
+        )
 
     warnings = []
     prepared = pd.DataFrame()
@@ -157,14 +158,8 @@ def aggregate_source(source: pd.DataFrame, batch_id: str) -> tuple[pd.DataFrame,
         if weight_col
         else 0
     )
-    if not weight_col:
-        warnings.append("No se encontró Peso Carga; las toneladas quedaron en cero.")
-    if destination_col:
-        destination = pd.to_numeric(source[destination_col], errors="coerce")
-        prepared = prepared[destination.eq(9025).to_numpy()]
-    else:
-        warnings.append("No se encontró Tp.almacén destino; no se aplicó el filtro 9025.")
-    prepared = prepared[prepared["actividad"].isin(["Picking", "Extracciones"])]
+    destination = pd.to_numeric(source[destination_col], errors="coerce")
+    prepared = prepared[destination.eq(9025).to_numpy()]
 
     if start_time_col and end_time_col:
         if start_date_col:
@@ -519,4 +514,3 @@ with tab_data:
             use_container_width=True,
             hide_index=True,
         )
-
